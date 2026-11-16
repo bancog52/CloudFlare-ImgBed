@@ -7,7 +7,7 @@ import {
     sanitizeUploadFolder
 } from "./uploadTools";
 import { getFileTypeCategory, normalizeMimeType, resolveFileType } from "../utils/mimeTypes.js";
-import { initializeChunkedUpload, handleChunkUpload, uploadLargeFileToTelegram, handleCleanupRequest } from "./chunkUpload";
+import { initializeChunkedUpload, handleChunkUpload, uploadLargeFileToTelegram, uploadLargeFileChunksToTelegram, handleCleanupRequest } from "./chunkUpload";
 import { handleChunkMerge } from "./chunkMerge";
 import { TelegramAPI } from "../utils/storage/telegramAPI";
 import { DiscordAPI } from "../utils/storage/discordAPI";
@@ -129,6 +129,9 @@ async function processFileUpload(context, formdata = null) {
             break;
         case 'external':
             uploadChannel = 'External';
+            break;
+        case 'dual':
+            uploadChannel = 'DualR2Telegram';
             break;
         default:
             uploadChannel = 'TelegramNew';
@@ -279,6 +282,12 @@ async function processFileUpload(context, formdata = null) {
         // --------------------外链渠道----------------------
         const res = await uploadFileToExternal(context, fullId, metadata, returnLink);
         return res;
+    } else if (uploadChannel === 'DualR2Telegram') {
+        // --------------R2(压缩图) + TG(原图冷备) 双写渠道--------------
+        if (getFileTypeCategory(fileType) !== 'image') {
+            return createResponse('Error: Only image files are supported in dual upload mode', { status: 400 });
+        }
+        return await uploadFileToDualR2AndTelegram(context, fullId, metadata, returnLink);
     } else {
         // ----------------Telegram New 渠道-------------------
         const res = await uploadFileToTelegram(context, fullId, metadata, fileExt, fileName, fileType, returnLink);
@@ -303,7 +312,119 @@ function buildUploadResponse(context, returnLink) {
     if (context.fileExpiresAt) {
         result.expiresAt = context.fileExpiresAt;
     }
+    if (context.backupStatus) {
+        result.backupStatus = context.backupStatus;
+    }
     return createUploadResponse(context, [result]);
+}
+
+// R2 主存压缩图 + Telegram 冷备无损原图（双写失败按宽松策略仅标记状态）
+async function uploadFileToDualR2AndTelegram(context, fullId, metadata, returnLink) {
+    const { env, waitUntil, uploadConfig, formdata, specifiedChannelName } = context;
+    const db = getDatabase(env);
+
+    if (typeof env.img_r2 == "undefined" || env.img_r2 == null || env.img_r2 == "") {
+        return createResponse('Error: Please configure R2 database', { status: 500 });
+    }
+
+    const r2Settings = uploadConfig.cfr2;
+    if (!r2Settings?.channels || r2Settings.channels.length === 0) {
+        return createResponse('Error: No R2 channel provided', { status: 400 });
+    }
+
+    let r2Channel = specifiedChannelName
+        ? r2Settings.channels.find(ch => ch.name === specifiedChannelName)
+        : null;
+    if (!r2Channel) {
+        r2Channel = r2Settings.channels[0];
+    }
+
+    // 1. 写入主存储 R2（压缩后的 WebP）
+    await env.img_r2.put(fullId, formdata.get('file'), {
+        httpMetadata: { contentType: metadata.FileType },
+    });
+
+    metadata.Channel = "CloudflareR2";
+    metadata.ChannelName = r2Channel.name || "R2_env";
+
+    const R2PublicUrl = r2Channel.publicUrl;
+    const moderateUrl = `${R2PublicUrl}/${fullId}`;
+    metadata.Label = await moderateContent(env, moderateUrl);
+
+    // 2. 冷备份无损原图到 Telegram（强制 sendDocument 防二次压缩）
+    let dbValue = "";
+    const originalFile = formdata.get('originalFile');
+
+    if (originalFile && typeof originalFile.arrayBuffer === 'function' && originalFile.size > 0) {
+        const origName = originalFile.name || metadata.FileName;
+        metadata.OriginalFileName = origName;
+        metadata.OriginalFileType = resolveFileType(origName, originalFile.type);
+        metadata.OriginalFileSize = (originalFile.size / 1024 / 1024).toFixed(2);
+        metadata.OriginalFileSizeBytes = originalFile.size;
+
+        const tgChannels = uploadConfig.telegram?.channels || [];
+        const tgChannel = tgChannels[0];
+        if (!tgChannel) {
+            metadata.BackupStatus = 'no_channel';
+        } else {
+            try {
+                const tgBotToken = tgChannel.botToken;
+                const tgChatId = tgChannel.chatId;
+                const tgProxyUrl = tgChannel.proxyUrl || '';
+                const CHUNK_SIZE = 16 * 1024 * 1024;
+
+                if (originalFile.size > CHUNK_SIZE) {
+                    const { chunks, totalChunks } = await uploadLargeFileChunksToTelegram(
+                        originalFile,
+                        origName,
+                        tgBotToken,
+                        tgChatId,
+                        tgProxyUrl
+                    );
+                    dbValue = JSON.stringify(chunks);
+                    metadata.BackupIsChunked = true;
+                    metadata.BackupTotalChunks = totalChunks;
+                } else {
+                    const telegramAPI = new TelegramAPI(tgBotToken, tgProxyUrl);
+                    const response = await telegramAPI.sendFile(
+                        originalFile,
+                        tgChatId,
+                        'sendDocument',
+                        'document',
+                        '',
+                        origName
+                    );
+                    const fileInfo = telegramAPI.getFileInfo(response);
+                    if (!fileInfo?.file_id) {
+                        throw new Error('Telegram API did not return file_id');
+                    }
+                    metadata.TgFileId = fileInfo.file_id;
+                }
+
+                metadata.BackupChannel = 'TelegramNew';
+                metadata.BackupChannelName = tgChannel.name;
+                metadata.BackupStatus = 'ok';
+            } catch (backupError) {
+                console.warn('Telegram cold backup failed (non-fatal):', backupError.message);
+                metadata.BackupStatus = 'failed';
+                metadata.BackupError = backupError.message;
+            }
+        }
+    } else {
+        metadata.BackupStatus = 'skipped';
+    }
+
+    context.backupStatus = metadata.BackupStatus;
+
+    // 3. 写入数据库元数据
+    try {
+        await db.put(fullId, dbValue, { metadata });
+    } catch (error) {
+        return createResponse('Error: Failed to write to database', { status: 500 });
+    }
+
+    waitUntil(endUpload(context, fullId, metadata));
+    return buildUploadResponse(context, returnLink);
 }
 
 // 上传到Cloudflare R2

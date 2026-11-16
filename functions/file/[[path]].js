@@ -134,10 +134,20 @@ export async function onRequest(context) {  // Contents of context object
 // 按存储渠道读取文件内容
 async function serveFileContent(context, db, imgRecord, fileId, encodedFileName, fileType) {
     const { request, env, url } = context;
+    const wantOriginal = url.searchParams.get('original') === '1' || url.searchParams.get('original') === 'true';
+
+    // 显式请求冷备原图时，优先从 Telegram 冷备通道读取
+    if (wantOriginal && imgRecord.metadata?.BackupChannel === 'TelegramNew' && imgRecord.metadata?.BackupStatus === 'ok') {
+        return await serveTelegramBackupFile(context, db, imgRecord, fileType);
+    }
 
     /* Cloudflare R2渠道 */
     if (imgRecord.metadata?.Channel === 'CloudflareR2') {
         const response = await handleR2File(context, fileId, encodedFileName, fileType);
+        if (response.status >= 400 && imgRecord.metadata?.BackupChannel === 'TelegramNew' && imgRecord.metadata?.BackupStatus === 'ok') {
+            const fallbackRes = await serveTelegramBackupFile(context, db, imgRecord, fileType);
+            return await transformImageResponse(context, fallbackRes);
+        }
         return await transformImageResponse(context, response);
     }
 
@@ -255,6 +265,63 @@ async function serveFileContent(context, db, imgRecord, fileId, encodedFileName,
     } catch (error) {
         return new Response('Error: ' + error, { status: 500 });
     }
+}
+
+// 从 Telegram 冷备通道读取无损原图（支持单文件与分片）
+async function serveTelegramBackupFile(context, db, imgRecord, fallbackFileType) {
+    const { request, env, url } = context;
+    const metadata = imgRecord.metadata || {};
+    const origName = metadata.OriginalFileName || metadata.FileName || 'original';
+    const encodedOrigName = encodeURIComponent(origName);
+    const origFileType = normalizeFileType(metadata.OriginalFileType) || fallbackFileType;
+
+    const backupMeta = {
+        ...metadata,
+        Channel: 'TelegramNew',
+        ChannelName: metadata.BackupChannelName || metadata.ChannelName,
+        TotalChunks: metadata.BackupTotalChunks || metadata.TotalChunks,
+    };
+
+    if (metadata.BackupIsChunked === true) {
+        return await handleTelegramChunkedFile(
+            context,
+            { ...imgRecord, metadata: backupMeta },
+            encodedOrigName,
+            origFileType
+        );
+    }
+
+    const tgFileId = metadata.TgFileId;
+    if (!tgFileId) {
+        return new Response('Error: Original backup file_id not found', { status: 404 });
+    }
+
+    const tgCredentials = await resolveTelegramCredentials(db, env, backupMeta);
+    const tgBotToken = tgCredentials.botToken;
+    const tgProxyUrl = tgCredentials.proxyUrl || '';
+    const tgApi = new TelegramAPI(tgBotToken, tgProxyUrl);
+    const filePath = await tgApi.getFilePath(tgFileId);
+    if (filePath === null) {
+        return new Response('Error: Failed to fetch original image path', { status: 500 });
+    }
+
+    const fileDomain = tgProxyUrl ? `https://${tgProxyUrl}` : 'https://api.telegram.org';
+    const targetUrl = `${fileDomain}/file/bot${tgBotToken}/${filePath}`;
+    const response = await getFileContent(request, targetUrl);
+    if (response === null) {
+        return new Response('Error: Failed to fetch original image', { status: 500 });
+    }
+    if (response.status === 404) {
+        return await return404(url);
+    }
+
+    const headers = new Headers(response.headers);
+    setCommonHeaders(headers, encodedOrigName, origFileType, getFileCacheControl(context));
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+    });
 }
 
 function withEtag(response, etag) {

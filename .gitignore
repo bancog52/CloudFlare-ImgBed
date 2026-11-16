@@ -12,4 +12,3 @@ node_modules
 .vscode/
 .claude/
 .agents/
-frontend-dist/

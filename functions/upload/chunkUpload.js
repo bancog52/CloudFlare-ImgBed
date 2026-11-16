@@ -1187,84 +1187,91 @@ export async function forceCleanupUpload(context, uploadId, totalChunks) {
     }
 }
 
+/* ======= 单个大文件分块上传到Telegram（可复用，仅返回分片元数据） ======= */
+export async function uploadLargeFileChunksToTelegram(file, fileName, tgBotToken, tgChatId, tgProxyUrl = '') {
+    const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB (TG Bot getFile download limit: 20MB, leave 4MB safety margin)
+    const fileSize = file.size;
+    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+
+    if (totalChunks > 50) {
+        const error = new Error('Error: File too large (exceeds 1GB limit)');
+        error.status = 413;
+        throw error;
+    }
+
+    const chunks = [];
+
+    // 分片上传，每10个分片做一次微小延迟以避免CPU超时
+    for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, fileSize);
+        const chunkBlob = file.slice(start, end);
+
+        const chunkFileName = `${fileName}.part${i.toString().padStart(3, '0')}`;
+        const chunkInfo = await uploadChunkToTelegramWithRetry(
+            tgBotToken,
+            tgChatId,
+            tgProxyUrl,
+            chunkBlob,
+            chunkFileName,
+            i,
+            totalChunks
+        );
+
+        if (!chunkInfo) {
+            throw new Error(`Failed to upload chunk ${i + 1}/${totalChunks} after retries`);
+        }
+        if (!chunkInfo.file_id || !chunkInfo.file_size) {
+            throw new Error(`Invalid chunk info for chunk ${i + 1}/${totalChunks}`);
+        }
+
+        chunks.push({
+            index: i,
+            fileId: chunkInfo.file_id,
+            size: chunkInfo.file_size,
+            fileName: chunkFileName
+        });
+
+        if (i > 0 && i % 10 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+    }
+
+    if (chunks.length !== totalChunks) {
+        throw new Error(`Chunk count mismatch: expected ${totalChunks}, got ${chunks.length}`);
+    }
+
+    return {
+        chunks,
+        totalChunks,
+        fileSizeMB: (fileSize / 1024 / 1024).toFixed(2),
+    };
+}
+
 /* ======= 单个大文件大文件分块上传到Telegram ======= */
 export async function uploadLargeFileToTelegram(context, file, fullId, metadata, fileName, fileType, returnLink, tgBotToken, tgChatId, tgChannel) {
     const { env, waitUntil } = context;
     const db = getDatabase(env);
 
-    const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB (TG Bot getFile download limit: 20MB, leave 4MB safety margin)
-    const fileSize = file.size;
-    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
-
-    // 为了避免CPU超时，限制最大分片数（考虑Cloudflare Worker的CPU时间限制）
-    if (totalChunks > 50) {
-        return createResponse('Error: File too large (exceeds 1GB limit)', { status: 413 });
-    }
-
-    const chunks = [];
-    const uploadedChunks = [];
-
     try {
-        // 分片上传，每10个分片做一次微小延迟以避免CPU超时
-        for (let i = 0; i < totalChunks; i++) {
-            const start = i * CHUNK_SIZE;
-            const end = Math.min(start + CHUNK_SIZE, fileSize);
-            const chunkBlob = file.slice(start, end);
-
-            // 生成分片文件名
-            const chunkFileName = `${fileName}.part${i.toString().padStart(3, '0')}`;
-
-            // 上传分片（带重试机制）
-            const tgProxyUrl = tgChannel.proxyUrl || '';
-            const chunkInfo = await uploadChunkToTelegramWithRetry(
-                tgBotToken,
-                tgChatId,
-                tgProxyUrl,
-                chunkBlob,
-                chunkFileName,
-                i,
-                totalChunks
-            );
-
-            if (!chunkInfo) {
-                throw new Error(`Failed to upload chunk ${i + 1}/${totalChunks} after retries`);
-            }
-
-            // 验证分片信息完整性
-            if (!chunkInfo.file_id || !chunkInfo.file_size) {
-                throw new Error(`Invalid chunk info for chunk ${i + 1}/${totalChunks}`);
-            }
-
-            chunks.push({
-                index: i,
-                fileId: chunkInfo.file_id,
-                size: chunkInfo.file_size,
-                fileName: chunkFileName
-            });
-
-            uploadedChunks.push(chunkInfo.file_id);
-
-            // 每10个分片检查一下，添加微小延迟避免CPU限制
-            if (i > 0 && i % 10 === 0) {
-                await new Promise(resolve => setTimeout(resolve, 50)); // 50ms延迟
-            }
-        }
+        const tgProxyUrl = tgChannel.proxyUrl || '';
+        const { chunks, totalChunks, fileSizeMB } = await uploadLargeFileChunksToTelegram(
+            file,
+            fileName,
+            tgBotToken,
+            tgChatId,
+            tgProxyUrl
+        );
 
         // 所有分片上传成功，更新metadata
         metadata.Channel = "TelegramNew";
         metadata.ChannelName = tgChannel.name;
         metadata.IsChunked = true;
         metadata.TotalChunks = totalChunks;
-        metadata.FileSize = (fileSize / 1024 / 1024).toFixed(2);
-
+        metadata.FileSize = fileSizeMB;
 
         // 将分片信息存储到value中
         const chunksData = JSON.stringify(chunks);
-
-        // 验证分片完整性
-        if (chunks.length !== totalChunks) {
-            throw new Error(`Chunk count mismatch: expected ${totalChunks}, got ${chunks.length}`);
-        }
 
         // 写入最终的数据库记录，分片信息作为value
         await db.put(fullId, chunksData, { metadata });
@@ -1295,6 +1302,9 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
         );
 
     } catch (error) {
+        if (error.status === 413) {
+            return createResponse(error.message, { status: 413 });
+        }
         return createResponse(`Telegram Channel Error: Large file upload failed - ${error.message}`, { status: 500 });
     }
 }
