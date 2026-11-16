@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ImgHub · R2 + Telegram 双写图床</title>
-  <link rel="stylesheet" href="/app.css?v=3" />
+  <link rel="stylesheet" href="/app.css?v=4" />
 </head>
 <body>
   <header class="topbar">
@@ -89,6 +89,7 @@
       <h3>登录 ImgHub</h3>
       <form id="loginForm">
         <input id="loginPassword" type="password" placeholder="请输入访问密码" required autocomplete="current-password" />
+        <div id="turnstileBox"></div>
         <div class="modal-actions">
           <button type="button" id="closeLoginModal" class="btn btn-ghost">取消</button>
           <button type="submit" class="btn btn-primary">确认登录</button>
@@ -111,6 +112,6 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script type="module" src="/app.js?v=3"></script>
+  <script type="module" src="/app.js?v=4"></script>
 </body>
 </html>

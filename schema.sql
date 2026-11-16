@@ -19,3 +19,4 @@ CREATE TABLE IF NOT EXISTS images (
 
 CREATE INDEX IF NOT EXISTS idx_images_created ON images(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_images_folder ON images(folder, created_at DESC);
+

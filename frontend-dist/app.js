@@ -70,9 +70,47 @@ function renderAuthBar() {
   }
 }
 
+let turnstileWidgetId = null;
+let turnstileToken = '';
+let turnstileScriptPromise = null;
+
+function loadTurnstileScript() {
+  if (window.turnstile) return Promise.resolve();
+  if (turnstileScriptPromise) return turnstileScriptPromise;
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    s.async = true;
+    s.defer = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('Turnstile 加载失败'));
+    document.head.appendChild(s);
+  });
+  return turnstileScriptPromise;
+}
+
+async function ensureTurnstileWidget() {
+  const siteKey = state.session.turnstileSiteKey;
+  if (!siteKey) return;
+  await loadTurnstileScript();
+  if (turnstileWidgetId !== null) {
+    turnstileToken = '';
+    window.turnstile.reset(turnstileWidgetId);
+    return;
+  }
+  turnstileWidgetId = window.turnstile.render('#turnstileBox', {
+    sitekey: siteKey,
+    theme: 'light',
+    callback: (token) => { turnstileToken = token; },
+    'expired-callback': () => { turnstileToken = ''; },
+    'error-callback': () => { turnstileToken = ''; },
+  });
+}
+
 function openLoginModal() {
   $('loginModal').classList.remove('hidden');
   $('loginPassword').focus();
+  ensureTurnstileWidget().catch(() => showToast('人机验证组件加载失败'));
 }
 
 $('authActionBtn').addEventListener('click', async () => {
@@ -91,20 +129,30 @@ $('closeLoginModal').addEventListener('click', () => {
 
 $('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (state.session.turnstileSiteKey && !turnstileToken) {
+    showToast('请等待人机验证完成');
+    return;
+  }
   const password = $('loginPassword').value;
   const res = await fetch('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password })
+    body: JSON.stringify({ password, turnstileToken })
   });
   if (res.ok) {
     $('loginModal').classList.add('hidden');
     $('loginPassword').value = '';
+    turnstileToken = '';
     showToast('登录成功');
     await checkSession();
     if ($('tab-gallery').classList.contains('active')) loadGallery();
   } else {
-    showToast('密码错误');
+    const err = await res.json().catch(() => ({}));
+    showToast(err.error || '登录失败');
+    if (turnstileWidgetId !== null && window.turnstile) {
+      turnstileToken = '';
+      window.turnstile.reset(turnstileWidgetId);
+    }
   }
 });
 

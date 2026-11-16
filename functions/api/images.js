@@ -75,3 +75,4 @@ export async function onRequestDelete({ request, env }) {
   await env.img_bed_db.prepare('DELETE FROM images WHERE id = ?').bind(id).run();
   return jsonResponse({ ok: true, id });
 }
+

@@ -78,3 +78,4 @@ export async function onRequestGet({ request, env, params }) {
 
   return serveFromTelegram(env, row, false);
 }
+
