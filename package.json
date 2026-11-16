@@ -3,9 +3,11 @@
   "version": "2.7.8",
   "private": true,
   "type": "module",
-  "workspaces": [
-    "deploy/profiles/*"
-  ],
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.726.1",
+    "@cloudflare/pages-plugin-sentry": "^1.1.3",
+    "@sentry/tracing": "^7.114.0"
+  },
   "scripts": {
     "ci-test": "concurrently --kill-others \"npm start\" \"wait-on http://localhost:8080 && mocha\"",
     "ci-test:docker": "concurrently --kill-others \"npm run start:docker\" \"wait-on http://localhost:8080 && mocha\"",
