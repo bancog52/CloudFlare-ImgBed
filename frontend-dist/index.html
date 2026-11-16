@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ImgHub · R2 + Telegram 双写图床</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span>ImgHub</span>
+        <span class="badge">R2 WebP + TG 原图冷备</span>
+      </div>
+      <nav class="tabs">
+        <button class="tab-btn active" data-tab="upload">上传台</button>
+        <button class="tab-btn" data-tab="gallery">图库管理</button>
+      </nav>
+      <div class="auth-bar">
+        <span id="authStatus" class="auth-status">检查中...</span>
+        <button id="authActionBtn" class="btn btn-ghost btn-sm hidden">登录</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- 上传台 -->
+    <section id="tab-upload" class="tab-panel active">
+      <div class="options-bar">
+        <label class="field">
+          <span>目录</span>
+          <input id="uploadFolder" type="text" placeholder="可选，如 blog/2026" />
+        </label>
+        <label class="field">
+          <span>命名</span>
+          <select id="uploadNameType">
+            <option value="default">随机前缀 + 原名</option>
+            <option value="index">纯随机 ID</option>
+            <option value="origin">保留原文件名</option>
+            <option value="short">短链接 ID</option>
+          </select>
+        </label>
+        <div class="policy-tip">
+          静态图 → 2048px WebP(0.8) 存 R2，原图无损冷备 TG ｜ 动图 → 仅存 TG ｜ 非图片 → 拦截
+        </div>
+      </div>
+
+      <div id="dropzone" class="dropzone" tabindex="0">
+        <input id="fileInput" type="file" accept="image/*" multiple hidden />
+        <div class="dropzone-icon">⬆</div>
+        <div class="dropzone-title">拖拽图片到这里，点击选择，或直接 Ctrl + V 粘贴截图</div>
+        <div class="dropzone-sub">仅支持图片文件；浏览器端自动完成 WebP 压缩与动图识别</div>
+      </div>
+
+      <div class="results-header">
+        <h2>上传记录</h2>
+        <div class="results-actions">
+          <button id="copyAllMdBtn" class="btn btn-ghost btn-sm" disabled>复制全部 Markdown</button>
+          <button id="clearQueueBtn" class="btn btn-ghost btn-sm">清空列表</button>
+        </div>
+      </div>
+      <div id="uploadList" class="upload-list"></div>
+    </section>
+
+    <!-- 图库管理 -->
+    <section id="tab-gallery" class="tab-panel">
+      <div id="adminGate" class="admin-gate hidden">
+        <div class="gate-card">
+          <h3>管理员登录</h3>
+          <p>查看和删除图库文件需要管理员权限</p>
+          <form id="adminLoginForm">
+            <input id="adminUser" type="text" placeholder="用户名（未设置可留空）" autocomplete="username" />
+            <input id="adminPass" type="password" placeholder="管理员密码" autocomplete="current-password" />
+            <button type="submit" class="btn btn-primary">登录图库</button>
+          </form>
+        </div>
+      </div>
+
+      <div id="galleryContent">
+        <div class="gallery-toolbar">
+          <input id="searchInput" type="search" placeholder="搜索文件名..." />
+          <input id="dirInput" type="text" placeholder="目录过滤，如 blog/" />
+          <button id="refreshGalleryBtn" class="btn btn-primary btn-sm">刷新</button>
+          <span id="galleryCount" class="gallery-count">共 0 张</span>
+        </div>
+
+        <div id="galleryGrid" class="gallery-grid"></div>
+
+        <div class="pagination">
+          <button id="prevPageBtn" class="btn btn-ghost btn-sm" disabled>上一页</button>
+          <span id="pageInfo">第 1 页</span>
+          <button id="nextPageBtn" class="btn btn-ghost btn-sm" disabled>下一页</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 用户登录弹窗 -->
+  <div id="userLoginModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>输入上传认证码</h3>
+      <form id="userLoginForm">
+        <input id="userAuthCode" type="password" placeholder="请输入 AuthCode" required />
+        <div class="modal-actions">
+          <button type="button" id="closeLoginModal" class="btn btn-ghost">取消</button>
+          <button type="submit" class="btn btn-primary">确认登录</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 大图预览弹窗 -->
+  <div id="previewModal" class="modal hidden">
+    <div class="preview-wrap">
+      <img id="previewImg" alt="preview" />
+      <div class="preview-bar">
+        <span id="previewMeta"></span>
+        <a id="previewOriginalLink" class="btn btn-primary btn-sm" target="_blank" rel="noopener">下载原图</a>
+        <button id="closePreviewModal" class="btn btn-ghost btn-sm">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
+
