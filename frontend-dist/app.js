@@ -5,9 +5,9 @@ const IMAGE_EXTS = new Set([
 ]);
 
 const state = {
-  session: { valid: false, authType: null, adminRequired: true, userRequired: false },
+  session: { authenticated: false, passwordRequired: true },
   uploadResults: [],
-  gallery: { start: 0, count: 30, total: 0 }
+  gallery: { page: 1, limit: 30, total: 0 }
 };
 
 const $ = (id) => document.getElementById(id);
@@ -45,11 +45,10 @@ async function copyText(text, label = '链接') {
 /* ==================== 鉴权 ==================== */
 async function checkSession() {
   try {
-    const res = await fetch('/api/auth/sessionCheck');
-    const data = await res.json();
-    state.session = data;
+    const res = await fetch('/api/session');
+    state.session = await res.json();
   } catch {
-    state.session = { valid: false, adminRequired: true, userRequired: false };
+    state.session = { authenticated: false, passwordRequired: true };
   }
   renderAuthBar();
 }
@@ -57,14 +56,13 @@ async function checkSession() {
 function renderAuthBar() {
   const statusEl = $('authStatus');
   const btn = $('authActionBtn');
-  if (state.session.valid) {
-    statusEl.textContent = state.session.authType === 'admin' ? '管理员已登录' : '已登录';
-    btn.textContent = '切换账号';
-    btn.classList.remove('hidden');
-  } else if (!state.session.userRequired) {
-    statusEl.textContent = '免密上传';
-    btn.textContent = '登录';
+  if (!state.session.passwordRequired) {
+    statusEl.textContent = '免密模式';
     btn.classList.add('hidden');
+  } else if (state.session.authenticated) {
+    statusEl.textContent = '已登录';
+    btn.textContent = '退出';
+    btn.classList.remove('hidden');
   } else {
     statusEl.textContent = '未登录';
     btn.textContent = '登录';
@@ -72,42 +70,58 @@ function renderAuthBar() {
   }
 }
 
-$('authActionBtn').addEventListener('click', () => {
-  $('userLoginModal').classList.remove('hidden');
-  $('userAuthCode').focus();
+function openLoginModal() {
+  $('loginModal').classList.remove('hidden');
+  $('loginPassword').focus();
+}
+
+$('authActionBtn').addEventListener('click', async () => {
+  if (state.session.authenticated) {
+    await fetch('/api/login', { method: 'DELETE' });
+    showToast('已退出登录');
+    await checkSession();
+  } else {
+    openLoginModal();
+  }
 });
 
 $('closeLoginModal').addEventListener('click', () => {
-  $('userLoginModal').classList.add('hidden');
+  $('loginModal').classList.add('hidden');
 });
 
-$('userLoginForm').addEventListener('submit', async (e) => {
+$('loginForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const authCode = $('userAuthCode').value;
-  const res = await fetch('/api/auth/login', {
+  const password = $('loginPassword').value;
+  const res = await fetch('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ authCode })
+    body: JSON.stringify({ password })
   });
   if (res.ok) {
-    $('userLoginModal').classList.add('hidden');
-    $('userAuthCode').value = '';
+    $('loginModal').classList.add('hidden');
+    $('loginPassword').value = '';
     showToast('登录成功');
     await checkSession();
+    if ($('tab-gallery').classList.contains('active')) loadGallery();
   } else {
-    showToast('认证码错误');
+    showToast('密码错误');
   }
 });
 
 /* ==================== 压缩与上传 ==================== */
 function compressImageForDual(file, maxDimension = 2048, quality = 0.8) {
-  if ((file.type || '').includes('svg')) return Promise.resolve(file);
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
     img.onload = () => {
-      let w = img.width;
-      let h = img.height;
+      const origW = img.width;
+      const origH = img.height;
+      if ((file.type || '').includes('svg')) {
+        URL.revokeObjectURL(url);
+        return resolve({ file, width: origW, height: origH });
+      }
+      let w = origW;
+      let h = origH;
       const maxSide = Math.max(w, h);
       if (maxSide > maxDimension) {
         const ratio = maxDimension / maxSide;
@@ -122,11 +136,11 @@ function compressImageForDual(file, maxDimension = 2048, quality = 0.8) {
         URL.revokeObjectURL(url);
         if (!blob) return reject(new Error('WebP 转换失败'));
         if (file.type === 'image/webp' && maxSide <= maxDimension && blob.size >= file.size) {
-          return resolve(file);
+          return resolve({ file, width: w, height: h });
         }
         const dot = file.name.lastIndexOf('.');
         const newName = (dot > 0 ? file.name.slice(0, dot) : file.name) + '.webp';
-        resolve(new File([blob], newName, { type: 'image/webp' }));
+        resolve({ file: new File([blob], newName, { type: 'image/webp' }), width: w, height: h });
       }, 'image/webp', quality);
     };
     img.onerror = () => {
@@ -147,17 +161,19 @@ function sendUploadXhr(url, formData, onProgress) {
     };
     xhr.onload = () => {
       if (xhr.status === 401) {
-        $('userLoginModal').classList.remove('hidden');
-        return reject(new Error('未登录或认证已过期'));
+        openLoginModal();
+        return reject(new Error('请先登录后再上传'));
       }
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch {
-          reject(new Error('响应解析失败'));
-        }
+      let data;
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch {
+        data = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && data?.ok) {
+        resolve(data);
       } else {
-        reject(new Error(xhr.responseText || `HTTP ${xhr.status}`));
+        reject(new Error(data?.error || xhr.responseText || `HTTP ${xhr.status}`));
       }
     };
     xhr.onerror = () => reject(new Error('网络错误'));
@@ -198,7 +214,7 @@ function createUploadRow(file) {
   item.append(thumb, info, actions);
   $('uploadList').prepend(item);
 
-  return { metaEl, fill, actions, thumb };
+  return { metaEl, fill, actions };
 }
 
 async function handleFiles(files) {
@@ -214,68 +230,56 @@ async function handleFiles(files) {
       const folder = $('uploadFolder').value.trim().replace(/^\/+|\/+$/g, '');
       const nameType = $('uploadNameType').value;
       const formData = new FormData();
+      formData.append('folder', folder);
+      formData.append('nameType', nameType);
 
-      let query;
       if (animated) {
         ui.metaEl.textContent = `动图 ${formatSize(file.size)} → 仅传 Telegram`;
+        formData.append('channel', 'tg');
         formData.append('file', file);
-        query = new URLSearchParams({
-          uploadChannel: 'telegram',
-          serverCompress: 'false',
-          uploadNameType: nameType,
-          uploadFolder: folder,
-          returnFormat: 'full'
-        });
       } else {
         ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 正在生成 WebP...`;
-        const webpFile = await compressImageForDual(file, 2048, 0.8);
-        ui.metaEl.textContent = `原图 ${formatSize(file.size)} → WebP ${formatSize(webpFile.size)}`;
+        const { file: webpFile, width, height } = await compressImageForDual(file, 2048, 0.8);
+        ui.metaEl.textContent = `原图 ${formatSize(file.size)} → WebP ${formatSize(webpFile.size)} (${width}×${height})`;
+        formData.append('channel', 'dual');
         formData.append('file', webpFile);
         formData.append('originalFile', file);
-        query = new URLSearchParams({
-          uploadChannel: 'dual',
-          uploadNameType: nameType,
-          uploadFolder: folder,
-          returnFormat: 'full'
-        });
+        if (width) formData.append('width', String(width));
+        if (height) formData.append('height', String(height));
       }
 
-      const res = await sendUploadXhr(`/upload?${query.toString()}`, formData, (pct) => {
+      const res = await sendUploadXhr('/api/upload', formData, (pct) => {
         ui.fill.style.width = `${pct}%`;
       });
-
-      const entry = Array.isArray(res) ? res[0] : res;
-      const fileUrl = entry.publicUrl || entry.src;
-      const backupStatus = entry.backupStatus;
 
       ui.fill.style.width = '100%';
       ui.fill.style.background = 'var(--success)';
 
       const tag = document.createElement('span');
-      if (animated) {
+      if (res.primaryChannel === 'tg') {
         tag.className = 'tag tag-info';
         tag.textContent = 'TG 动图';
-      } else if (backupStatus === 'ok') {
+      } else if (res.backupStatus === 'ok') {
         tag.className = 'tag tag-ok';
         tag.textContent = 'R2 + TG冷备';
       } else {
         tag.className = 'tag tag-warn';
-        tag.textContent = `R2成功 (冷备:${backupStatus || '跳过'})`;
+        tag.textContent = `R2成功 (冷备:${res.backupStatus})`;
       }
       ui.metaEl.append(' ', tag);
 
       const copyUrlBtn = document.createElement('button');
       copyUrlBtn.className = 'btn btn-ghost btn-sm';
       copyUrlBtn.textContent = '复制链接';
-      copyUrlBtn.onclick = () => copyText(fileUrl, '直链');
+      copyUrlBtn.onclick = () => copyText(res.url, '直链');
 
       const copyMdBtn = document.createElement('button');
       copyMdBtn.className = 'btn btn-primary btn-sm';
       copyMdBtn.textContent = 'Markdown';
-      copyMdBtn.onclick = () => copyText(`![${file.name}](${fileUrl})`, 'Markdown');
+      copyMdBtn.onclick = () => copyText(res.markdown, 'Markdown');
 
       ui.actions.append(copyUrlBtn, copyMdBtn);
-      state.uploadResults.unshift({ name: file.name, url: fileUrl });
+      state.uploadResults.unshift({ name: file.name, url: res.url, md: res.markdown });
       $('copyAllMdBtn').disabled = false;
     } catch (err) {
       ui.fill.style.background = 'var(--danger)';
@@ -311,7 +315,7 @@ window.addEventListener('paste', (e) => {
 });
 
 $('copyAllMdBtn').addEventListener('click', () => {
-  const md = state.uploadResults.map((r) => `![${r.name}](${r.url})`).join('\n');
+  const md = state.uploadResults.map((r) => r.md).join('\n');
   copyText(md, '全部 Markdown');
 });
 $('clearQueueBtn').addEventListener('click', () => {
@@ -323,34 +327,30 @@ $('clearQueueBtn').addEventListener('click', () => {
 /* ==================== 图库管理 ==================== */
 async function loadGallery() {
   const params = new URLSearchParams({
-    start: String(state.gallery.start),
-    count: String(state.gallery.count),
-    recursive: 'true',
-    search: $('searchInput').value.trim(),
-    dir: $('dirInput').value.trim()
+    page: String(state.gallery.page),
+    limit: String(state.gallery.limit),
+    q: $('searchInput').value.trim(),
+    folder: $('dirInput').value.trim()
   });
-  const res = await fetch(`/api/manage/list?${params.toString()}`);
+  const res = await fetch(`/api/images?${params.toString()}`);
   if (res.status === 401) {
-    $('adminGate').classList.remove('hidden');
-    $('galleryContent').classList.add('hidden');
+    openLoginModal();
     return;
   }
-  $('adminGate').classList.add('hidden');
-  $('galleryContent').classList.remove('hidden');
-
   const data = await res.json();
-  const files = data.files || [];
-  state.gallery.total = data.totalCount || files.length;
-  $('galleryCount').textContent = `共 ${state.gallery.total} 张`;
+  const items = data.items || [];
+  state.gallery.total = data.total || 0;
+
+  const stats = data.stats || {};
+  $('galleryCount').textContent =
+    `共 ${stats.total_count ?? state.gallery.total} 张 · R2 ${formatSize(stats.r2_bytes || 0)} · TG冷备 ${formatSize(stats.tg_bytes || 0)}`;
 
   const grid = $('galleryGrid');
   grid.innerHTML = '';
 
-  for (const item of files) {
-    const meta = item.metadata || {};
-    const fileId = item.name;
-    const fileUrl = `${location.origin}/file/${fileId}`;
-    const hasBackup = meta.BackupChannel === 'TelegramNew' && meta.BackupStatus === 'ok';
+  for (const row of items) {
+    const fileUrl = `${location.origin}/file/${row.id}`;
+    const hasBackup = !!(row.tg_file_id || row.tg_chunks);
 
     const card = document.createElement('div');
     card.className = 'card';
@@ -359,9 +359,9 @@ async function loadGallery() {
     imgWrap.className = 'card-img-wrap';
     const img = document.createElement('img');
     img.loading = 'lazy';
-    img.src = `/file/${fileId}`;
-    img.alt = meta.FileName || fileId;
-    imgWrap.onclick = () => openPreview(fileId, meta, hasBackup);
+    img.src = `/file/${row.id}`;
+    img.alt = row.original_name || row.file_name;
+    imgWrap.onclick = () => openPreview(row, hasBackup);
     imgWrap.appendChild(img);
 
     const body = document.createElement('div');
@@ -369,16 +369,18 @@ async function loadGallery() {
 
     const title = document.createElement('div');
     title.className = 'card-title';
-    title.textContent = meta.FileName || fileId;
-    title.title = fileId;
+    title.textContent = row.original_name || row.file_name;
+    title.title = row.id;
 
     const metaRow = document.createElement('div');
     metaRow.className = 'card-meta';
-    const sizeText = meta.OriginalFileSize
-      ? `${meta.FileSize || '?'}MB (原图 ${meta.OriginalFileSize}MB)`
-      : `${meta.FileSize || '?'}MB`;
+    const sizeText = row.original_size && row.primary_channel === 'r2'
+      ? `${formatSize(row.size_bytes)} (原 ${formatSize(row.original_size)})`
+      : formatSize(row.size_bytes);
     const chTag = document.createElement('span');
-    chTag.textContent = hasBackup ? 'R2+TG' : (meta.Channel === 'CloudflareR2' ? 'R2' : 'TG');
+    chTag.textContent = row.primary_channel === 'tg'
+      ? 'TG动图'
+      : (row.backup_status === 'ok' ? 'R2+TG' : 'R2');
     metaRow.append(document.createTextNode(sizeText), chTag);
 
     const actions = document.createElement('div');
@@ -392,7 +394,7 @@ async function loadGallery() {
     const mdBtn = document.createElement('button');
     mdBtn.className = 'btn btn-ghost btn-sm';
     mdBtn.textContent = 'MD';
-    mdBtn.onclick = () => copyText(`![${meta.FileName || fileId}](${fileUrl})`, 'Markdown');
+    mdBtn.onclick = () => copyText(`![${row.original_name || row.file_name}](${fileUrl})`, 'Markdown');
 
     actions.append(copyBtn, mdBtn);
 
@@ -400,7 +402,7 @@ async function loadGallery() {
       const origLink = document.createElement('a');
       origLink.className = 'btn btn-ghost btn-sm';
       origLink.textContent = '原图';
-      origLink.href = `/file/${fileId}?original=1`;
+      origLink.href = `/file/${row.id}?original=1`;
       origLink.target = '_blank';
       origLink.rel = 'noopener';
       actions.appendChild(origLink);
@@ -410,8 +412,8 @@ async function loadGallery() {
     delBtn.className = 'btn btn-danger btn-sm';
     delBtn.textContent = '删除';
     delBtn.onclick = async () => {
-      if (!confirm(`确认删除 ${meta.FileName || fileId}？`)) return;
-      const delRes = await fetch(`/api/manage/delete/${encodeURIComponent(fileId)}`, { method: 'DELETE' });
+      if (!confirm(`确认删除 ${row.original_name || row.file_name}？`)) return;
+      const delRes = await fetch(`/api/images?id=${encodeURIComponent(row.id)}`, { method: 'DELETE' });
       if (delRes.ok) {
         showToast('已删除');
         loadGallery();
@@ -426,19 +428,18 @@ async function loadGallery() {
     grid.appendChild(card);
   }
 
-  const page = Math.floor(state.gallery.start / state.gallery.count) + 1;
-  const totalPages = Math.max(1, Math.ceil(state.gallery.total / state.gallery.count));
-  $('pageInfo').textContent = `第 ${page} / ${totalPages} 页`;
-  $('prevPageBtn').disabled = state.gallery.start <= 0;
-  $('nextPageBtn').disabled = state.gallery.start + state.gallery.count >= state.gallery.total;
+  const totalPages = Math.max(1, Math.ceil(state.gallery.total / state.gallery.limit));
+  $('pageInfo').textContent = `第 ${state.gallery.page} / ${totalPages} 页`;
+  $('prevPageBtn').disabled = state.gallery.page <= 1;
+  $('nextPageBtn').disabled = state.gallery.page >= totalPages;
 }
 
-function openPreview(fileId, meta, hasBackup) {
-  $('previewImg').src = `/file/${fileId}`;
-  $('previewMeta').textContent = `${meta.FileName || fileId} · ${meta.Width || '?'}×${meta.Height || '?'}`;
+function openPreview(row, hasBackup) {
+  $('previewImg').src = `/file/${row.id}`;
+  $('previewMeta').textContent = `${row.original_name || row.file_name} · ${row.width || '?'}×${row.height || '?'}`;
   const link = $('previewOriginalLink');
   if (hasBackup) {
-    link.href = `/file/${fileId}?original=1`;
+    link.href = `/file/${row.id}?original=1`;
     link.classList.remove('hidden');
   } else {
     link.classList.add('hidden');
@@ -451,41 +452,22 @@ $('closePreviewModal').addEventListener('click', () => {
   $('previewImg').src = '';
 });
 
-$('adminLoginForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const res = await fetch('/api/auth/adminLogin', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      username: $('adminUser').value,
-      password: $('adminPass').value
-    })
-  });
-  if (res.ok) {
-    showToast('管理员登录成功');
-    await checkSession();
-    loadGallery();
-  } else {
-    showToast('账号或密码错误');
-  }
-});
-
 $('refreshGalleryBtn').addEventListener('click', () => {
-  state.gallery.start = 0;
+  state.gallery.page = 1;
   loadGallery();
 });
 $('searchInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
-    state.gallery.start = 0;
+    state.gallery.page = 1;
     loadGallery();
   }
 });
 $('prevPageBtn').addEventListener('click', () => {
-  state.gallery.start = Math.max(0, state.gallery.start - state.gallery.count);
+  state.gallery.page = Math.max(1, state.gallery.page - 1);
   loadGallery();
 });
 $('nextPageBtn').addEventListener('click', () => {
-  state.gallery.start += state.gallery.count;
+  state.gallery.page += 1;
   loadGallery();
 });
 
@@ -501,4 +483,3 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
 });
 
 checkSession();
-
