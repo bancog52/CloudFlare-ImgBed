@@ -282,14 +282,28 @@ async function checkDuplicateByHash(fileHash) {
   return data?.exists ? data : null;
 }
 
-async function handleFiles(files) {
-  for (const file of files) {
-    if (!isImageFile(file)) {
-      showToast(`已跳过非图片文件: ${file.name}`);
-      continue;
-    }
+const MAX_BATCH_FILES = 15;
+const BATCH_INTERVAL_MS = 1500;
 
+async function handleFiles(files) {
+  const imageFiles = files.filter((f) => {
+    if (!isImageFile(f)) {
+      showToast(`已跳过非图片文件: ${f.name}`);
+      return false;
+    }
+    return true;
+  });
+
+  if (imageFiles.length === 0) return;
+  if (imageFiles.length > MAX_BATCH_FILES) {
+    showToast(`为避免触发 Telegram 限流，单次最多上传 ${MAX_BATCH_FILES} 张图片`);
+    return;
+  }
+
+  for (let i = 0; i < imageFiles.length; i++) {
+    const file = imageFiles[i];
     const ui = createUploadRow(file);
+    let wasDeduplicated = false;
     try {
       ui.metaEl.textContent = `原图 ${formatSize(file.size)} · 校验去重中...`;
       const fileHash = await computeSha256(file);
@@ -297,6 +311,7 @@ async function handleFiles(files) {
 
       if (res) {
         ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 已存在`;
+        wasDeduplicated = true;
       } else {
         const animated = await isAnimatedImage(file);
         const folder = $('uploadFolder').value.trim().replace(/^\/+|\/+$/g, '');
@@ -364,6 +379,10 @@ async function handleFiles(files) {
       errTag.className = 'tag tag-err';
       errTag.textContent = err.message;
       ui.metaEl.append(' ', errTag);
+    }
+
+    if (!wasDeduplicated && i < imageFiles.length - 1) {
+      await new Promise((r) => setTimeout(r, BATCH_INTERVAL_MS));
     }
   }
 }
