@@ -1,3 +1,23 @@
+/**
+ * ImgHub 本地图片上传脚本（供 Typora / Obsidian / 桌面悬浮球 / 其他脚本调用）
+ *
+ * 用法:
+ *   node tools/upload.mjs [--progress] <本地图片路径或HTTP图片URL ...>
+ *
+ * 参数说明:
+ *   --progress  可选，向 stderr 输出 PROGRESS:<pct> 与 BYTES:<n> 进度信息（Typora 调用时请勿加此参数）
+ *
+ * 配置来源（优先读取进程环境变量，其次读取项目根目录 ../.env）:
+ *   API_TOKEN   必填，与 Cloudflare Pages 环境变量 API_TOKEN 一致（Bearer 鉴权）
+ *   IMGHUB_URL  可选，默认 https://imbed.970799.xyz
+ *   若需走本地代理加速，可设置 NODE_USE_ENV_PROXY=1 与 HTTPS_PROXY=http://127.0.0.1:7890
+ *
+ * 处理规则:
+ *   1. 动图（多帧 GIF/WebP/APNG）：跳过压缩，channel=tg 直传 Telegram
+ *   2. 静态图：使用 sharp 等比缩放到最长边 <= 2048px、WebP 0.8 存 R2，同时保留原图冷备 Telegram
+ *   3. 上传目录默认写入 folder=typora，成功后向 stdout 逐行打印图片访问 URL
+ *  node "D:\OneDrive\cursor\cloudflare\imghub\tools\upload.mjs"
+ * /
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

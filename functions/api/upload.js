@@ -72,6 +72,63 @@ async function uploadToTelegram(cfg, file, fileName) {
   return { tgFileId: res.fileId, tgChunks: null };
 }
 
+function buildDeduplicatedResult(origin, row) {
+  const fileUrl = `${origin}/file/${row.id}`;
+  const name = row.original_name || row.file_name || 'image';
+  return {
+    ok: true,
+    exists: true,
+    deduplicated: true,
+    id: row.id,
+    url: fileUrl,
+    markdown: `![${name}](${fileUrl})`,
+    primaryChannel: row.primary_channel,
+    backupStatus: row.backup_status,
+    sizeBytes: row.size_bytes,
+    originalSize: row.original_size,
+  };
+}
+
+function normalizeHash(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(s) ? s : '';
+}
+
+async function computeSha256Hex(blob) {
+  const buf = await blob.arrayBuffer();
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function findByHash(db, hash) {
+  if (!hash) return null;
+  return db
+    .prepare('SELECT id, file_name, original_name, primary_channel, backup_status, size_bytes, original_size FROM images WHERE file_hash = ? LIMIT 1')
+    .bind(hash)
+    .first();
+}
+
+export async function onRequestGet({ request, env }) {
+  if (!(await isAuthorized(request, env))) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+  if (!env.img_bed_db) {
+    return jsonResponse({ error: 'D1 database (img_bed_db) is not bound' }, 500);
+  }
+
+  const url = new URL(request.url);
+  const hash = normalizeHash(url.searchParams.get('hash'));
+  if (!hash) {
+    return jsonResponse({ error: 'Invalid hash' }, 400);
+  }
+
+  const existing = await findByHash(env.img_bed_db, hash);
+  if (!existing) {
+    return jsonResponse({ ok: true, exists: false });
+  }
+  return jsonResponse(buildDeduplicatedResult(url.origin, existing));
+}
+
 export async function onRequestPost({ request, env }) {
   if (!(await isAuthorized(request, env))) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
@@ -97,6 +154,18 @@ export async function onRequestPost({ request, env }) {
   const width = parseInt(form.get('width'), 10) || null;
   const height = parseInt(form.get('height'), 10) || null;
   const originalFile = form.get('originalFile');
+  const hasOrig = originalFile && typeof originalFile.arrayBuffer === 'function' && originalFile.size > 0;
+  const hashSource = hasOrig ? originalFile : file;
+
+  let fileHash = normalizeHash(form.get('fileHash'));
+  if (!fileHash) {
+    fileHash = await computeSha256Hex(hashSource);
+  }
+
+  const existing = await findByHash(env.img_bed_db, fileHash);
+  if (existing) {
+    return jsonResponse(buildDeduplicatedResult(url.origin, existing));
+  }
 
   const id = buildFileId(folder, file.name, file.type, nameType);
   const mimeType = file.type || 'application/octet-stream';
@@ -133,7 +202,6 @@ export async function onRequestPost({ request, env }) {
       httpMetadata: { contentType: mimeType },
     });
 
-    const hasOrig = originalFile && typeof originalFile.arrayBuffer === 'function' && originalFile.size > 0;
     const backupSource = hasOrig ? originalFile : file;
     originalName = backupSource.name || file.name;
     originalMime = backupSource.type || mimeType;
@@ -159,8 +227,8 @@ export async function onRequestPost({ request, env }) {
       `INSERT INTO images (
         id, file_name, folder, mime_type, size_bytes, width, height,
         primary_channel, tg_file_id, tg_chunks, backup_status, backup_error,
-        original_name, original_mime, original_size, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        original_name, original_mime, original_size, file_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -178,6 +246,7 @@ export async function onRequestPost({ request, env }) {
       originalName,
       originalMime,
       originalSize,
+      fileHash,
       now
     )
     .run();

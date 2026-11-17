@@ -265,6 +265,23 @@ function createUploadRow(file) {
   return { metaEl, fill, actions };
 }
 
+async function computeSha256(file) {
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function checkDuplicateByHash(fileHash) {
+  const res = await fetch(`/api/upload?hash=${encodeURIComponent(fileHash)}`);
+  if (res.status === 401) {
+    openLoginModal();
+    throw new Error('请先登录后再上传');
+  }
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data?.exists ? data : null;
+}
+
 async function handleFiles(files) {
   for (const file of files) {
     if (!isImageFile(file)) {
@@ -274,37 +291,49 @@ async function handleFiles(files) {
 
     const ui = createUploadRow(file);
     try {
-      const animated = await isAnimatedImage(file);
-      const folder = $('uploadFolder').value.trim().replace(/^\/+|\/+$/g, '');
-      const nameType = $('uploadNameType').value;
-      const formData = new FormData();
-      formData.append('folder', folder);
-      formData.append('nameType', nameType);
+      ui.metaEl.textContent = `原图 ${formatSize(file.size)} · 校验去重中...`;
+      const fileHash = await computeSha256(file);
+      let res = await checkDuplicateByHash(fileHash);
 
-      if (animated) {
-        ui.metaEl.textContent = `动图 ${formatSize(file.size)} → 仅传 Telegram`;
-        formData.append('channel', 'tg');
-        formData.append('file', file);
+      if (res) {
+        ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 已存在`;
       } else {
-        ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 正在生成 WebP...`;
-        const { file: webpFile, width, height } = await compressImageForDual(file, 2048, 0.8);
-        ui.metaEl.textContent = `原图 ${formatSize(file.size)} → WebP ${formatSize(webpFile.size)} (${width}×${height})`;
-        formData.append('channel', 'dual');
-        formData.append('file', webpFile);
-        formData.append('originalFile', file);
-        if (width) formData.append('width', String(width));
-        if (height) formData.append('height', String(height));
-      }
+        const animated = await isAnimatedImage(file);
+        const folder = $('uploadFolder').value.trim().replace(/^\/+|\/+$/g, '');
+        const nameType = $('uploadNameType').value;
+        const formData = new FormData();
+        formData.append('folder', folder);
+        formData.append('nameType', nameType);
+        formData.append('fileHash', fileHash);
 
-      const res = await sendUploadXhr('/api/upload', formData, (pct) => {
-        ui.fill.style.width = `${pct}%`;
-      });
+        if (animated) {
+          ui.metaEl.textContent = `动图 ${formatSize(file.size)} → 仅传 Telegram`;
+          formData.append('channel', 'tg');
+          formData.append('file', file);
+        } else {
+          ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 正在生成 WebP...`;
+          const { file: webpFile, width, height } = await compressImageForDual(file, 2048, 0.8);
+          ui.metaEl.textContent = `原图 ${formatSize(file.size)} → WebP ${formatSize(webpFile.size)} (${width}×${height})`;
+          formData.append('channel', 'dual');
+          formData.append('file', webpFile);
+          formData.append('originalFile', file);
+          if (width) formData.append('width', String(width));
+          if (height) formData.append('height', String(height));
+        }
+
+        res = await sendUploadXhr('/api/upload', formData, (pct) => {
+          ui.fill.style.width = `${pct}%`;
+        });
+      }
 
       ui.fill.style.width = '100%';
       ui.fill.style.background = 'var(--success)';
 
       const tag = document.createElement('span');
-      if (res.primaryChannel === 'tg') {
+      if (res.deduplicated) {
+        tag.className = 'tag tag-info';
+        tag.textContent = '秒传 (已存在)';
+      } else if (res.primaryChannel === 'tg') {
         tag.className = 'tag tag-info';
         tag.textContent = 'TG 动图';
       } else if (res.backupStatus === 'ok') {

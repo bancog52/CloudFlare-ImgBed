@@ -14,9 +14,10 @@ CREATE TABLE IF NOT EXISTS images (
   original_name TEXT,
   original_mime TEXT,
   original_size INTEGER,
+  file_hash TEXT,
   created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_images_created ON images(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_images_folder ON images(folder, created_at DESC);
-
+CREATE INDEX IF NOT EXISTS idx_images_hash ON images(file_hash);
