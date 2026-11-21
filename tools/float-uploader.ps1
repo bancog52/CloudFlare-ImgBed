@@ -5,8 +5,6 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $UploadScript = Join-Path $ScriptDir 'upload.mjs'
 $ImageExts = @('.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.svg', '.bmp', '.ico', '.tif', '.tiff', '.heic', '.heif', '.apng')
-$MaxBatchFiles = 15
-$BatchIntervalMs = 1500
 
 $script:FormatMode = 'md' # md | url | html
 $script:LastBatch = @()
@@ -415,14 +413,6 @@ function Start-NextInQueue() {
   Set-UiState 'busy' "$prefix$fileName"
 }
 
-$delayTimer = New-Object System.Windows.Forms.Timer
-$delayTimer.Interval = $BatchIntervalMs
-$delayTimer.Add_Tick({
-  $delayTimer.Stop()
-  Start-NextInQueue
-  $pollTimer.Start()
-})
-
 $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 50
 $pollTimer.Add_Tick({
@@ -446,7 +436,6 @@ $pollTimer.Add_Tick({
       Remove-Item -LiteralPath $currentPath -Force -EA SilentlyContinue
     }
 
-    $wasDedup = $stderr -match 'DEDUP:1'
     if ($code -eq 0 -and $stdout -match '^(https?://\S+)') {
       $url = $Matches[1]
       $name = [System.IO.Path]::GetFileNameWithoutExtension($currentPath)
@@ -470,12 +459,7 @@ $pollTimer.Add_Tick({
 
     if ($script:QueueIndex -lt $script:QueueTotal) {
       $script:QueueIndex++
-      if (-not $wasDedup -and $BatchIntervalMs -gt 0) {
-        $pollTimer.Stop()
-        $delayTimer.Start()
-      } else {
-        Start-NextInQueue
-      }
+      Start-NextInQueue
       return
     }
 
@@ -507,10 +491,6 @@ function Run-Upload([string[]]$paths, [bool]$deleteTemp = $false) {
     }
   }
   if ($valid.Count -eq 0) { return }
-  if ($valid.Count -gt $MaxBatchFiles) {
-    Set-UiState 'err' "Max $MaxBatchFiles images per batch (selected $($valid.Count))"
-    return
-  }
 
   $script:QueuePaths = $valid
   $script:QueueTotal = $valid.Count

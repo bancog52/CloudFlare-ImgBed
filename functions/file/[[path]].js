@@ -9,14 +9,24 @@ function buildHeaders(mimeType, fileName) {
 
 export async function onRequestGet({ env, params }) {
   const pathParts = Array.isArray(params.path) ? params.path : [params.path];
-  const id = pathParts.filter(Boolean).join('/');
-  if (!id) return new Response('Not Found', { status: 404 });
+  const rawId = pathParts.filter(Boolean).join('/');
+  if (!rawId) return new Response('Not Found', { status: 404 });
+
+  let id = rawId;
+  try {
+    id = pathParts.filter(Boolean).map((p) => decodeURIComponent(p)).join('/');
+  } catch {
+    id = rawId;
+  }
 
   if (!env.img_r2) {
     return new Response('R2 bucket is not bound', { status: 500 });
   }
 
-  const obj = await env.img_r2.get(id);
+  let obj = await env.img_r2.get(id);
+  if (!obj && id !== rawId) {
+    obj = await env.img_r2.get(rawId);
+  }
   if (!obj) {
     return new Response('Not Found', { status: 404 });
   }

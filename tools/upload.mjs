@@ -5,18 +5,19 @@
  *   node tools/upload.mjs [--progress] <本地图片路径或HTTP图片URL ...>
  *
  * 参数说明:
- *   --progress  可选，向 stderr 输出 PROGRESS:<pct> 与 BYTES:<n> 进度信息（Typora 调用时请勿加此参数）
+ *   --progress  可选，向 stderr 输出 PROGRESS:<pct> 与 DEDUP:1 进度信息（Typora 调用时请勿加此参数）
  *
  * 配置来源（优先读取进程环境变量，其次读取项目根目录 ../.env）:
- *   API_TOKEN   必填，与 Cloudflare Pages 环境变量 API_TOKEN 一致（Bearer 鉴权）
- *   IMGHUB_URL  可选，默认 https://imbed.970799.xyz
- *   若需走本地代理加速，可设置 NODE_USE_ENV_PROXY=1 与 HTTPS_PROXY=http://127.0.0.1:7890
+ *   API_TOKEN         必填，与 Cloudflare Pages 环境变量 API_TOKEN 一致（Bearer 鉴权）
+ *   IMGHUB_URL        可选，默认 https://imbed.970799.xyz
+ *   LOCAL_BACKUP_DIR  可选，本地原图按月备份根目录，默认 D:\OneDrive\文档\archive\imghub_bk
  *
  * 处理规则:
- *   1. 动图（多帧 GIF/WebP/APNG）：跳过压缩，channel=tg 直传 Telegram
- *   2. 静态图：使用 sharp 等比缩放到最长边 <= 2048px、WebP 0.8 存 R2，同时保留原图冷备 Telegram
- *   3. 默认不传 folder（由服务端统一按月份归档），成功后向 stdout 逐行打印图片访问 URL
- *   4. Typora命令：node "D:\OneDrive\cursor\cloudflare\imghub\tools\upload.mjs"
+ *   1. 本地原图备份：自动按月份子目录（如 2026-11）复制一份原图到 LOCAL_BACKUP_DIR（以 <hash前8位>_<原文件名> 命名防覆盖与重复）
+ *   2. SHA-256 秒传预检：若服务端已存在相同原图哈希，直接返回旧 URL，跳过压缩与上传
+ *   3. 动图（多帧 GIF/WebP/APNG）：跳过压缩，原格式直接上传至 Cloudflare R2
+ *   4. 静态图：使用 sharp（BMP/ICO 自动经 Windows System.Drawing 转 PNG 兜底）等比缩放到 <= 2048px、WebP 0.8 上传至 Cloudflare R2
+ *   5. 成功后向 stdout 逐行打印图片访问 URL
  */
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -28,10 +29,10 @@ import { promisify } from 'node:util';
 import sharp from 'sharp';
 
 const execFileAsync = promisify(execFile);
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DEFAULT_BASE_URL = 'https://imbed.970799.xyz';
+const DEFAULT_BACKUP_DIR = 'D:\\OneDrive\\文档\\archive\\imghub_bk';
 
 const MIME_BY_EXT = {
   jpg: 'image/jpeg',
@@ -75,7 +76,6 @@ function getMime(fileName) {
   return MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
-// sharp 不支持 BMP/ICO 等格式时，借助 Windows 原生 System.Drawing 先无损转为 PNG 再压缩
 async function convertToPngFallback(buffer) {
   const tmpIn = path.join(os.tmpdir(), `imghub_in_${crypto.randomUUID()}.bin`);
   const tmpOut = path.join(os.tmpdir(), `imghub_out_${crypto.randomUUID()}.png`);
@@ -102,7 +102,23 @@ async function readInputFile(input) {
   return { buffer, fileName: path.basename(input) };
 }
 
-async function uploadOne(input, baseUrl, apiToken, reportProgress = false) {
+async function backupOriginalLocally(buffer, fileName, fileHash, backupRoot) {
+  if (!backupRoot) return;
+  const now = new Date();
+  const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const monthDir = path.join(backupRoot, ym);
+  await fs.mkdir(monthDir, { recursive: true });
+
+  const safeName = (fileName || 'image.png').replace(/[<>:"/\\|?*]/g, '_');
+  const targetPath = path.join(monthDir, `${fileHash.slice(0, 8)}_${safeName}`);
+  try {
+    await fs.access(targetPath);
+  } catch {
+    await fs.writeFile(targetPath, buffer);
+  }
+}
+
+async function uploadOne(input, baseUrl, apiToken, backupRoot, reportProgress = false) {
   const emit = (pct) => {
     if (reportProgress) process.stderr.write(`PROGRESS:${pct}\n`);
   };
@@ -110,6 +126,10 @@ async function uploadOne(input, baseUrl, apiToken, reportProgress = false) {
   const { buffer, fileName } = await readInputFile(input);
   const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
 
+  // 1. 先在本地 OneDrive 按月份子文件夹备份一份无损原图
+  await backupOriginalLocally(buffer, fileName, fileHash, backupRoot);
+
+  // 2. SHA-256 秒传预检
   try {
     const checkRes = await fetch(`${baseUrl}/api/upload?hash=${fileHash}`, {
       headers: { Authorization: `Bearer ${apiToken}` },
@@ -147,16 +167,13 @@ async function uploadOne(input, baseUrl, apiToken, reportProgress = false) {
   form.append('folder', '');
   form.append('nameType', 'default');
   form.append('fileHash', fileHash);
+  form.append('originalName', fileName);
+  form.append('originalSize', String(buffer.length));
 
-  let payloadBytes = buffer.length;
-  if (isAnimated) {
-    form.append('channel', 'tg');
+  if (isAnimated || ext === 'svg') {
     form.append('file', new Blob([buffer], { type: origMime }), fileName);
-  } else if (ext === 'svg') {
-    form.append('channel', 'dual');
-    form.append('file', new Blob([buffer], { type: origMime }), fileName);
-    form.append('originalFile', new Blob([buffer], { type: origMime }), fileName);
-    payloadBytes = buffer.length * 2;
+    if (meta.width) form.append('width', String(meta.width));
+    if (meta.height) form.append('height', String(meta.height));
   } else {
     const pipeline = sharp(sharpInput)
       .rotate()
@@ -169,16 +186,12 @@ async function uploadOne(input, baseUrl, apiToken, reportProgress = false) {
     const useOriginal = ext === 'webp' && Math.max(meta.width || 0, meta.height || 0) <= 2048 && webpBuf.length >= buffer.length;
     const uploadBuf = useOriginal ? buffer : webpBuf;
     const uploadName = `${baseName}.webp`;
-    payloadBytes = uploadBuf.length + buffer.length;
 
-    form.append('channel', 'dual');
     form.append('file', new Blob([uploadBuf], { type: 'image/webp' }), uploadName);
-    form.append('originalFile', new Blob([buffer], { type: origMime }), fileName);
     if (info.width) form.append('width', String(info.width));
     if (info.height) form.append('height', String(info.height));
   }
 
-  if (reportProgress) process.stderr.write(`BYTES:${payloadBytes}\n`);
   emit(20);
 
   const res = await fetch(`${baseUrl}/api/upload`, {
@@ -209,6 +222,7 @@ async function main() {
   const envFile = await loadEnv();
   const apiToken = (process.env.API_TOKEN || envFile.API_TOKEN || '').trim();
   const baseUrl = (process.env.IMGHUB_URL || envFile.IMGHUB_URL || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const backupRoot = (process.env.LOCAL_BACKUP_DIR || envFile.LOCAL_BACKUP_DIR || DEFAULT_BACKUP_DIR).trim();
 
   if (!apiToken) {
     console.error('未找到 API_TOKEN，请在项目根目录 .env 中填写 API_TOKEN');
@@ -216,7 +230,7 @@ async function main() {
   }
 
   for (const input of inputs) {
-    const url = await uploadOne(input, baseUrl, apiToken, reportProgress);
+    const url = await uploadOne(input, baseUrl, apiToken, backupRoot, reportProgress);
     console.log(url);
   }
 }
@@ -225,4 +239,3 @@ main().catch((err) => {
   console.error(err.message || err);
   process.exit(1);
 });
-
