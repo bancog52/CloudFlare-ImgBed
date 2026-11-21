@@ -1,11 +1,8 @@
 import { isAuthorized, jsonResponse } from '../lib/auth.js';
-import { getTgConfig, sendDocument, uploadLargeDocument } from '../lib/telegram.js';
 
 const IMAGE_EXTS = new Set([
   'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp', 'ico', 'tif', 'tiff', 'heic', 'heif', 'apng',
 ]);
-
-const TG_CHUNK_THRESHOLD = 16 * 1024 * 1024;
 
 function sanitizeFolder(raw) {
   return String(raw || '')
@@ -25,6 +22,8 @@ function getExt(name, mime) {
     'image/gif': 'gif',
     'image/avif': 'avif',
     'image/svg+xml': 'svg',
+    'image/bmp': 'bmp',
+    'image/apng': 'apng',
   };
   return map[(mime || '').toLowerCase()] || 'bin';
 }
@@ -63,15 +62,6 @@ function buildFileId(folder, fileName, mime, nameType) {
   return folder ? `${folder}/${key}` : key;
 }
 
-async function uploadToTelegram(cfg, file, fileName) {
-  if (file.size > TG_CHUNK_THRESHOLD) {
-    const chunks = await uploadLargeDocument(cfg, file, fileName);
-    return { tgFileId: null, tgChunks: JSON.stringify(chunks) };
-  }
-  const res = await sendDocument(cfg, file, fileName);
-  return { tgFileId: res.fileId, tgChunks: null };
-}
-
 function buildDeduplicatedResult(origin, row) {
   const fileUrl = `${origin}/file/${row.id}`;
   const name = row.original_name || row.file_name || 'image';
@@ -82,8 +72,7 @@ function buildDeduplicatedResult(origin, row) {
     id: row.id,
     url: fileUrl,
     markdown: `![${name}](${fileUrl})`,
-    primaryChannel: row.primary_channel,
-    backupStatus: row.backup_status,
+    primaryChannel: 'r2',
     sizeBytes: row.size_bytes,
     originalSize: row.original_size,
   };
@@ -103,7 +92,7 @@ async function computeSha256Hex(blob) {
 async function findByHash(db, hash) {
   if (!hash) return null;
   return db
-    .prepare('SELECT id, file_name, original_name, primary_channel, backup_status, size_bytes, original_size FROM images WHERE file_hash = ? LIMIT 1')
+    .prepare('SELECT id, file_name, original_name, primary_channel, size_bytes, original_size FROM images WHERE file_hash = ? LIMIT 1')
     .bind(hash)
     .first();
 }
@@ -133,9 +122,11 @@ export async function onRequestPost({ request, env }) {
   if (!(await isAuthorized(request, env))) {
     return jsonResponse({ error: 'Unauthorized' }, 401);
   }
-
   if (!env.img_bed_db) {
     return jsonResponse({ error: 'D1 database (img_bed_db) is not bound' }, 500);
+  }
+  if (!env.img_r2) {
+    return jsonResponse({ error: 'R2 bucket (img_r2) is not bound' }, 500);
   }
 
   const form = await request.formData();
@@ -148,18 +139,16 @@ export async function onRequestPost({ request, env }) {
   }
 
   const url = new URL(request.url);
-  const channel = form.get('channel') || url.searchParams.get('channel') || 'dual';
   const folder = sanitizeFolder(form.get('folder') || url.searchParams.get('folder') || '');
   const nameType = String(form.get('nameType') || url.searchParams.get('nameType') || 'default');
   const width = parseInt(form.get('width'), 10) || null;
   const height = parseInt(form.get('height'), 10) || null;
-  const originalFile = form.get('originalFile');
-  const hasOrig = originalFile && typeof originalFile.arrayBuffer === 'function' && originalFile.size > 0;
-  const hashSource = hasOrig ? originalFile : file;
+  const originalName = String(form.get('originalName') || file.name);
+  const originalSize = parseInt(form.get('originalSize'), 10) || file.size;
 
   let fileHash = normalizeHash(form.get('fileHash'));
   if (!fileHash) {
-    fileHash = await computeSha256Hex(hashSource);
+    fileHash = await computeSha256Hex(file);
   }
 
   const existing = await findByHash(env.img_bed_db, fileHash);
@@ -169,58 +158,11 @@ export async function onRequestPost({ request, env }) {
 
   const id = buildFileId(folder, file.name, file.type, nameType);
   const mimeType = file.type || 'application/octet-stream';
-  const tgCfg = getTgConfig(env);
   const now = Date.now();
 
-  let primaryChannel = 'r2';
-  let tgFileId = null;
-  let tgChunks = null;
-  let backupStatus = 'none';
-  let backupError = null;
-  let originalName = file.name;
-  let originalMime = mimeType;
-  let originalSize = file.size;
-
-  if (channel === 'tg') {
-    if (!tgCfg) {
-      return jsonResponse({ error: '动图需通过 Telegram 存储，请先配置 TG_BOT_TOKEN 与 TG_CHAT_ID' }, 400);
-    }
-    primaryChannel = 'tg';
-    try {
-      const tgRes = await uploadToTelegram(tgCfg, file, file.name);
-      tgFileId = tgRes.tgFileId;
-      tgChunks = tgRes.tgChunks;
-      backupStatus = 'ok';
-    } catch (err) {
-      return jsonResponse({ error: `Telegram 上传失败: ${err.message}` }, 502);
-    }
-  } else {
-    if (!env.img_r2) {
-      return jsonResponse({ error: 'R2 bucket (img_r2) is not bound' }, 500);
-    }
-    await env.img_r2.put(id, file.stream(), {
-      httpMetadata: { contentType: mimeType },
-    });
-
-    const backupSource = hasOrig ? originalFile : file;
-    originalName = backupSource.name || file.name;
-    originalMime = backupSource.type || mimeType;
-    originalSize = backupSource.size;
-
-    if (!tgCfg) {
-      backupStatus = 'unconfigured';
-    } else {
-      try {
-        const tgRes = await uploadToTelegram(tgCfg, backupSource, originalName);
-        tgFileId = tgRes.tgFileId;
-        tgChunks = tgRes.tgChunks;
-        backupStatus = 'ok';
-      } catch (err) {
-        backupStatus = 'failed';
-        backupError = err.message;
-      }
-    }
-  }
+  await env.img_r2.put(id, file.stream(), {
+    httpMetadata: { contentType: mimeType },
+  });
 
   await env.img_bed_db
     .prepare(
@@ -228,7 +170,7 @@ export async function onRequestPost({ request, env }) {
         id, file_name, folder, mime_type, size_bytes, width, height,
         primary_channel, tg_file_id, tg_chunks, backup_status, backup_error,
         original_name, original_mime, original_size, file_hash, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'r2', NULL, NULL, 'none', NULL, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -238,13 +180,8 @@ export async function onRequestPost({ request, env }) {
       file.size,
       width,
       height,
-      primaryChannel,
-      tgFileId,
-      tgChunks,
-      backupStatus,
-      backupError,
       originalName,
-      originalMime,
+      mimeType,
       originalSize,
       fileHash,
       now
@@ -257,11 +194,8 @@ export async function onRequestPost({ request, env }) {
     id,
     url: fileUrl,
     markdown: `![${originalName}](${fileUrl})`,
-    primaryChannel,
-    backupStatus,
-    backupError,
+    primaryChannel: 'r2',
     sizeBytes: file.size,
     originalSize,
   });
 }
-

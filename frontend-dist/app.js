@@ -7,17 +7,17 @@ const IMAGE_EXTS = new Set([
 const state = {
   session: { authenticated: false, passwordRequired: true },
   uploadResults: [],
-  gallery: { page: 1, limit: 30, total: 0 }
+  gallery: { page: 1, limit: 100, total: 0 }
 };
 
 const $ = (id) => document.getElementById(id);
 
-function showToast(msg) {
+function showToast(msg, duration = 2600) {
   const el = $('toast');
   el.textContent = msg;
   el.classList.remove('hidden');
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.add('hidden'), 2400);
+  showToast._t = setTimeout(() => el.classList.add('hidden'), duration);
 }
 
 function formatSize(bytes) {
@@ -157,7 +157,7 @@ $('loginForm').addEventListener('submit', async (e) => {
 });
 
 /* ==================== 压缩与上传 ==================== */
-function compressImageForDual(file, maxDimension = 2048, quality = 0.8) {
+function compressImageToWebp(file, maxDimension = 2048, quality = 0.8) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -282,9 +282,6 @@ async function checkDuplicateByHash(fileHash) {
   return data?.exists ? data : null;
 }
 
-const MAX_BATCH_FILES = 15;
-const BATCH_INTERVAL_MS = 1500;
-
 async function handleFiles(files) {
   const imageFiles = files.filter((f) => {
     if (!isImageFile(f)) {
@@ -295,43 +292,37 @@ async function handleFiles(files) {
   });
 
   if (imageFiles.length === 0) return;
-  if (imageFiles.length > MAX_BATCH_FILES) {
-    showToast(`为避免触发 Telegram 限流，单次最多上传 ${MAX_BATCH_FILES} 张图片`);
-    return;
-  }
 
-  for (let i = 0; i < imageFiles.length; i++) {
-    const file = imageFiles[i];
+  let uploadedNewCount = 0;
+  for (const file of imageFiles) {
     const ui = createUploadRow(file);
-    let wasDeduplicated = false;
     try {
       ui.metaEl.textContent = `原图 ${formatSize(file.size)} · 校验去重中...`;
       const fileHash = await computeSha256(file);
       let res = await checkDuplicateByHash(fileHash);
+      let isAnimated = false;
 
       if (res) {
         ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 已存在`;
-        wasDeduplicated = true;
       } else {
-        const animated = await isAnimatedImage(file);
+        isAnimated = await isAnimatedImage(file);
         const folder = $('uploadFolder').value.trim().replace(/^\/+|\/+$/g, '');
         const nameType = $('uploadNameType').value;
         const formData = new FormData();
         formData.append('folder', folder);
         formData.append('nameType', nameType);
         formData.append('fileHash', fileHash);
+        formData.append('originalName', file.name);
+        formData.append('originalSize', String(file.size));
 
-        if (animated) {
-          ui.metaEl.textContent = `动图 ${formatSize(file.size)} → 仅传 Telegram`;
-          formData.append('channel', 'tg');
+        if (isAnimated) {
+          ui.metaEl.textContent = `动图 ${formatSize(file.size)} → 原格式直传 R2`;
           formData.append('file', file);
         } else {
-          ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 正在生成 WebP...`;
-          const { file: webpFile, width, height } = await compressImageForDual(file, 2048, 0.8);
-          ui.metaEl.textContent = `原图 ${formatSize(file.size)} → WebP ${formatSize(webpFile.size)} (${width}×${height})`;
-          formData.append('channel', 'dual');
+          ui.metaEl.textContent = `原图 ${formatSize(file.size)} → 正在压缩 WebP...`;
+          const { file: webpFile, width, height } = await compressImageToWebp(file, 2048, 0.8);
+          ui.metaEl.textContent = `原图 ${formatSize(file.size)} → WebP ${formatSize(webpFile.size)} (${width}×${height}) · 未备份原图`;
           formData.append('file', webpFile);
-          formData.append('originalFile', file);
           if (width) formData.append('width', String(width));
           if (height) formData.append('height', String(height));
         }
@@ -339,6 +330,7 @@ async function handleFiles(files) {
         res = await sendUploadXhr('/api/upload', formData, (pct) => {
           ui.fill.style.width = `${pct}%`;
         });
+        uploadedNewCount++;
       }
 
       ui.fill.style.width = '100%';
@@ -348,15 +340,12 @@ async function handleFiles(files) {
       if (res.deduplicated) {
         tag.className = 'tag tag-info';
         tag.textContent = '秒传 (已存在)';
-      } else if (res.primaryChannel === 'tg') {
+      } else if (isAnimated) {
         tag.className = 'tag tag-info';
-        tag.textContent = 'TG 动图';
-      } else if (res.backupStatus === 'ok') {
-        tag.className = 'tag tag-ok';
-        tag.textContent = 'R2 + TG冷备';
+        tag.textContent = 'R2 动图';
       } else {
-        tag.className = 'tag tag-warn';
-        tag.textContent = `R2成功 (冷备:${res.backupStatus})`;
+        tag.className = 'tag tag-ok';
+        tag.textContent = 'R2 WebP';
       }
       ui.metaEl.append(' ', tag);
 
@@ -380,10 +369,10 @@ async function handleFiles(files) {
       errTag.textContent = err.message;
       ui.metaEl.append(' ', errTag);
     }
+  }
 
-    if (!wasDeduplicated && i < imageFiles.length - 1) {
-      await new Promise((r) => setTimeout(r, BATCH_INTERVAL_MS));
-    }
+  if (uploadedNewCount > 0) {
+    showToast('已压缩上传至 R2（网页端未保存原图，请自行本地备份）', 3600);
   }
 }
 
@@ -439,14 +428,13 @@ async function loadGallery() {
 
   const stats = data.stats || {};
   $('galleryCount').textContent =
-    `共 ${stats.total_count ?? state.gallery.total} 张 · R2 ${formatSize(stats.r2_bytes || 0)} · TG冷备 ${formatSize(stats.tg_bytes || 0)}`;
+    `共 ${stats.total_count ?? state.gallery.total} 张 · R2 已用 ${formatSize(stats.r2_bytes || 0)}`;
 
   const grid = $('galleryGrid');
   grid.innerHTML = '';
 
   for (const row of items) {
     const fileUrl = `${location.origin}/file/${row.id}`;
-    const hasBackup = !!(row.tg_file_id || row.tg_chunks);
 
     const card = document.createElement('div');
     card.className = 'card';
@@ -457,7 +445,7 @@ async function loadGallery() {
     img.loading = 'lazy';
     img.src = `/file/${row.id}`;
     img.alt = row.original_name || row.file_name;
-    imgWrap.onclick = () => openPreview(row, hasBackup);
+    imgWrap.onclick = () => openPreview(row);
     imgWrap.appendChild(img);
 
     const body = document.createElement('div');
@@ -470,13 +458,10 @@ async function loadGallery() {
 
     const metaRow = document.createElement('div');
     metaRow.className = 'card-meta';
-    const sizeText = row.original_size && row.primary_channel === 'r2'
-      ? `${formatSize(row.size_bytes)} (原 ${formatSize(row.original_size)})`
-      : formatSize(row.size_bytes);
+    const sizeText = formatSize(row.size_bytes);
+    const dimText = (row.width && row.height) ? `${row.width}×${row.height}` : 'R2';
     const chTag = document.createElement('span');
-    chTag.textContent = row.primary_channel === 'tg'
-      ? 'TG动图'
-      : (row.backup_status === 'ok' ? 'R2+TG' : 'R2');
+    chTag.textContent = dimText;
     metaRow.append(document.createTextNode(sizeText), chTag);
 
     const actions = document.createElement('div');
@@ -492,18 +477,6 @@ async function loadGallery() {
     mdBtn.textContent = 'MD';
     mdBtn.onclick = () => copyText(`![${row.original_name || row.file_name}](${fileUrl})`, 'Markdown');
 
-    actions.append(copyBtn, mdBtn);
-
-    if (hasBackup) {
-      const origLink = document.createElement('a');
-      origLink.className = 'btn btn-ghost btn-sm';
-      origLink.textContent = '原图';
-      origLink.href = `/file/${row.id}?original=1`;
-      origLink.target = '_blank';
-      origLink.rel = 'noopener';
-      actions.appendChild(origLink);
-    }
-
     const delBtn = document.createElement('button');
     delBtn.className = 'btn btn-danger btn-sm';
     delBtn.textContent = '删除';
@@ -517,8 +490,8 @@ async function loadGallery() {
         showToast('删除失败');
       }
     };
-    actions.appendChild(delBtn);
 
+    actions.append(copyBtn, mdBtn, delBtn);
     body.append(title, metaRow, actions);
     card.append(imgWrap, body);
     grid.appendChild(card);
@@ -530,16 +503,9 @@ async function loadGallery() {
   $('nextPageBtn').disabled = state.gallery.page >= totalPages;
 }
 
-function openPreview(row, hasBackup) {
+function openPreview(row) {
   $('previewImg').src = `/file/${row.id}`;
-  $('previewMeta').textContent = `${row.original_name || row.file_name} · ${row.width || '?'}×${row.height || '?'}`;
-  const link = $('previewOriginalLink');
-  if (hasBackup) {
-    link.href = `/file/${row.id}?original=1`;
-    link.classList.remove('hidden');
-  } else {
-    link.classList.add('hidden');
-  }
+  $('previewMeta').textContent = `${row.original_name || row.file_name} · ${row.width || '?'}×${row.height || '?'} · ${formatSize(row.size_bytes)}`;
   $('previewModal').classList.remove('hidden');
 }
 

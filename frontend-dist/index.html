@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ImgHub · R2 + Telegram 双写图床</title>
-  <link rel="stylesheet" href="/app.css?v=6" />
+  <title>ImgHub · Cloudflare R2 图床</title>
+  <link rel="stylesheet" href="/app.css?v=7" />
 </head>
 <body>
   <header class="topbar">
@@ -12,7 +12,7 @@
       <div class="brand">
         <span class="brand-dot"></span>
         <span>ImgHub</span>
-        <span class="badge">R2 WebP + TG 原图冷备</span>
+        <span class="badge">Cloudflare R2 图床</span>
       </div>
       <nav class="tabs">
         <button class="tab-btn active" data-tab="upload">上传台</button>
@@ -42,8 +42,8 @@
             <option value="short">短链接 ID</option>
           </select>
         </label>
-        <div class="policy-tip">
-          静态图 → 2048px WebP(0.8) 存 R2，原图冷备 TG ｜ 动图 → 仅存 TG ｜ 非图片 → 拦截
+        <div class="policy-tip" style="color: #b45309; font-weight: 500;">
+          ⚠️ 提醒：网页端上传会自动压缩图片（动图保留原格式）且不保存原图，请自行在本地备份原图
         </div>
       </div>
 
@@ -51,7 +51,7 @@
         <input id="fileInput" type="file" accept="image/*" multiple hidden />
         <div class="dropzone-icon">⬆</div>
         <div class="dropzone-title">拖拽图片到这里，点击选择，或直接 Ctrl + V 粘贴截图</div>
-        <div class="dropzone-sub">仅支持图片文件；浏览器端自动完成 WebP 压缩与动图识别</div>
+        <div class="dropzone-sub">静态图自动压缩为 ≤2048px WebP(0.8) 存入 R2；动图保留原格式存入 R2（网页端不备份原图）</div>
       </div>
 
       <div class="results-header">
@@ -104,7 +104,6 @@
       <img id="previewImg" alt="preview" />
       <div class="preview-bar">
         <span id="previewMeta"></span>
-        <a id="previewOriginalLink" class="btn btn-primary btn-sm" target="_blank" rel="noopener">下载原图</a>
         <button id="closePreviewModal" class="btn btn-ghost btn-sm">关闭</button>
       </div>
     </div>
@@ -112,6 +111,6 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script type="module" src="/app.js?v=6"></script>
+  <script type="module" src="/app.js?v=7"></script>
 </body>
 </html>

@@ -15,13 +15,19 @@
  * 处理规则:
  *   1. 动图（多帧 GIF/WebP/APNG）：跳过压缩，channel=tg 直传 Telegram
  *   2. 静态图：使用 sharp 等比缩放到最长边 <= 2048px、WebP 0.8 存 R2，同时保留原图冷备 Telegram
- *   3. 上传目录默认写入 folder=typora，成功后向 stdout 逐行打印图片访问 URL
- *  node "D:\OneDrive\cursor\cloudflare\imghub\tools\upload.mjs"
- * /
+ *   3. 默认不传 folder（由服务端统一按月份归档），成功后向 stdout 逐行打印图片访问 URL
+ *   4. Typora命令：node "D:\OneDrive\cursor\cloudflare\imghub\tools\upload.mjs"
+ */
+import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import sharp from 'sharp';
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -69,6 +75,21 @@ function getMime(fileName) {
   return MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
+// sharp 不支持 BMP/ICO 等格式时，借助 Windows 原生 System.Drawing 先无损转为 PNG 再压缩
+async function convertToPngFallback(buffer) {
+  const tmpIn = path.join(os.tmpdir(), `imghub_in_${crypto.randomUUID()}.bin`);
+  const tmpOut = path.join(os.tmpdir(), `imghub_out_${crypto.randomUUID()}.png`);
+  await fs.writeFile(tmpIn, buffer);
+  try {
+    const psCmd = `Add-Type -AssemblyName System.Drawing; $img=[System.Drawing.Image]::FromFile('${tmpIn.replace(/'/g, "''")}'); try { $img.Save('${tmpOut.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png) } finally { $img.Dispose() }`;
+    await execFileAsync('powershell.exe', ['-NoProfile', '-Command', psCmd], { windowsHide: true });
+    return await fs.readFile(tmpOut);
+  } finally {
+    await fs.rm(tmpIn, { force: true }).catch(() => {});
+    await fs.rm(tmpOut, { force: true }).catch(() => {});
+  }
+}
+
 async function readInputFile(input) {
   if (/^https?:\/\//i.test(input)) {
     const res = await fetch(input);
@@ -87,23 +108,45 @@ async function uploadOne(input, baseUrl, apiToken, reportProgress = false) {
   };
   emit(5);
   const { buffer, fileName } = await readInputFile(input);
+  const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
+
+  try {
+    const checkRes = await fetch(`${baseUrl}/api/upload?hash=${fileHash}`, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+    });
+    if (checkRes.ok) {
+      const checkData = await checkRes.json().catch(() => null);
+      if (checkData?.exists && checkData?.url) {
+        if (reportProgress) process.stderr.write('DEDUP:1\n');
+        emit(100);
+        return checkData.url;
+      }
+    }
+  } catch {
+    // 预检失败时继续走正常上传
+  }
+
   const origMime = getMime(fileName);
   const ext = path.extname(fileName).slice(1).toLowerCase();
 
   let isAnimated = false;
   let meta = {};
+  let sharpInput = buffer;
   if (ext !== 'svg') {
     try {
       meta = await sharp(buffer, { animated: true }).metadata();
       isAnimated = (meta.pages || 1) > 1;
     } catch {
+      sharpInput = await convertToPngFallback(buffer);
+      meta = await sharp(sharpInput).metadata();
       isAnimated = false;
     }
   }
 
   const form = new FormData();
-  form.append('folder', 'typora');
+  form.append('folder', '');
   form.append('nameType', 'default');
+  form.append('fileHash', fileHash);
 
   let payloadBytes = buffer.length;
   if (isAnimated) {
@@ -115,7 +158,7 @@ async function uploadOne(input, baseUrl, apiToken, reportProgress = false) {
     form.append('originalFile', new Blob([buffer], { type: origMime }), fileName);
     payloadBytes = buffer.length * 2;
   } else {
-    const pipeline = sharp(buffer)
+    const pipeline = sharp(sharpInput)
       .rotate()
       .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true });
     const { data: webpBuf, info } = await pipeline
