@@ -47,17 +47,22 @@ function buildFileId(folder, fileName, mime, nameType) {
   const ext = getExt(fileName, mime);
   const now = new Date();
   const ym = `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-  const baseName = (fileName || 'image').replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
+  const asciiBase = (fileName || '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 32);
 
   let key;
-  if (nameType === 'origin' && baseName) {
-    key = `${baseName}.${ext}`;
+  if (nameType === 'origin' && asciiBase) {
+    key = `${asciiBase}.${ext}`;
   } else if (nameType === 'short') {
     key = `${randomId(6)}.${ext}`;
-  } else if (nameType === 'index') {
-    key = `${ym}/${randomId(10)}.${ext}`;
+  } else if (nameType === 'index' || !asciiBase) {
+    key = `${ym}/${randomId(8)}.${ext}`;
   } else {
-    key = `${ym}/${randomId(6)}_${baseName || 'img'}.${ext}`;
+    key = `${ym}/${randomId(6)}_${asciiBase}.${ext}`;
   }
   return folder ? `${folder}/${key}` : key;
 }
